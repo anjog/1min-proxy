@@ -23,7 +23,7 @@ Eigenständige Neuentwicklung — kein Fork. Ziel war die Migration von der vera
 ## Installation
 
 ```bash
-git clone https://github.com/DEIN_USERNAME/1min-proxy.git
+git clone https://github.com/anjog/1min-proxy.git
 cd 1min-proxy
 
 python3 -m venv venv

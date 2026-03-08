@@ -23,7 +23,7 @@ A standalone implementation — not a fork. The goal was to migrate from the dep
 ## Installation
 
 ```bash
-git clone https://github.com/YOUR_USERNAME/1min-proxy.git
+git clone https://github.com/anjog/1min-proxy.git
 cd 1min-proxy
 
 python3 -m venv venv
