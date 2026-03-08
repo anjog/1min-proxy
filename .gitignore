@@ -4,3 +4,5 @@ __pycache__/
 *.pyo
 .venv/
 venv/
+NOTES.md
+proxy.log
