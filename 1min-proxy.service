@@ -1,0 +1,20 @@
+[Unit]
+Description=1min.ai OpenAI-Compatible Proxy (neue Chat-API)
+After=network.target
+
+[Service]
+User=andre
+Group=andre
+WorkingDirectory=/home/andre/projects/own/1min-proxy
+Environment="PATH=/home/andre/projects/own/1min-proxy/venv/bin:/usr/local/bin:/usr/bin:/bin"
+Environment=PYTHONUNBUFFERED=1
+Environment=PROXY_PORT=5002
+EnvironmentFile=-/home/andre/projects/own/1min-proxy/.env
+ExecStart=/home/andre/projects/own/1min-proxy/venv/bin/python3 main.py
+Restart=always
+RestartSec=10
+StandardOutput=append:/home/andre/projects/own/1min-proxy/proxy.log
+StandardError=append:/home/andre/projects/own/1min-proxy/proxy.log
+
+[Install]
+WantedBy=multi-user.target
