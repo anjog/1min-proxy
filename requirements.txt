@@ -5,3 +5,4 @@ tiktoken>=0.7
 coloredlogs>=15.0
 flask-limiter>=4.0
 pymemcache>=4.0
+python-dotenv>=1.0

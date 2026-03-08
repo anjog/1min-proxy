@@ -15,6 +15,9 @@ Streaming-Events der neuen API:
   event: error    → data: {"error": "..."}       Fehler
 """
 
+from dotenv import load_dotenv
+load_dotenv()
+
 from flask import Flask, request, jsonify, make_response, Response
 import requests
 import time
