@@ -4,7 +4,10 @@
 
 OpenAI-kompatibler Proxy für [1min.ai](https://1min.ai), basierend auf der neuen **Chat-with-AI API** (`UNIFY_CHAT_WITH_AI`).
 
-Eigenständige Neuentwicklung — kein Fork. Ziel war die Migration von der veralteten AI Feature API (`/api/features`) auf die neue, strukturierte Chat-API (`/api/chat-with-ai`).
+Eigenständige Neuentwicklung auf Basis von [1min-relay](https://github.com/kokofixcomputers/1min-relay). Zwei Probleme motivierten einen Neustart statt eines direkten Forks:
+
+1. **Neue API:** 1min.ai hat die alte AI Feature API (`/api/features`) durch eine neue Chat-API (`/api/chat-with-ai`, Typ `UNIFY_CHAT_WITH_AI`) abgelöst. 1min-relay nutzt noch die Legacy-API, die deprecated werden wird.
+2. **Saubereres Streaming:** Die neue API sendet strukturierte SSE-Events statt eines rohen Byte-Streams — der Crawling-Injektions-Workaround aus 1min-relay wird damit überflüssig (das Problem tritt mit der neuen API gar nicht mehr auf).
 
 ## Features
 
@@ -65,10 +68,10 @@ Der Proxy ist als Drop-in-Ersatz für die OpenAI-API konzipiert. API-Key = dein 
 
 ```bash
 # Modelle auflisten
-curl http://localhost:5002/v1/models
+curl http://localhost:5001/v1/models
 
 # Chat-Anfrage (Non-Streaming)
-curl http://localhost:5002/v1/chat/completions \
+curl http://localhost:5001/v1/chat/completions \
   -H "Authorization: Bearer DEIN_1MIN_API_KEY" \
   -H "Content-Type: application/json" \
   -d '{
@@ -77,7 +80,7 @@ curl http://localhost:5002/v1/chat/completions \
   }'
 
 # Streaming
-curl http://localhost:5002/v1/chat/completions \
+curl http://localhost:5001/v1/chat/completions \
   -H "Authorization: Bearer DEIN_1MIN_API_KEY" \
   -H "Content-Type: application/json" \
   -d '{

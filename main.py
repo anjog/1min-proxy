@@ -1,18 +1,18 @@
 """
-1min-proxy — OpenAI-kompatibler Proxy für 1min.ai
+1min-proxy — OpenAI-compatible proxy for 1min.ai
 
-Basiert auf der neuen Chat-with-AI API (UNIFY_CHAT_WITH_AI, März 2026).
-Kein Fork — eigenständige Neuentwicklung.
+Based on the new Chat-with-AI API (UNIFY_CHAT_WITH_AI, March 2026).
+Not a fork — standalone reimplementation.
 
-Neue API vs. Legacy:
-  Legacy:  POST /api/features          type=CHAT_WITH_AI    Roher Textstream
-  Neu:     POST /api/chat-with-ai      type=UNIFY_CHAT_WITH_AI  Strukturiertes SSE
+New API vs. legacy:
+  Legacy:  POST /api/features          type=CHAT_WITH_AI           Raw text stream
+  New:     POST /api/chat-with-ai      type=UNIFY_CHAT_WITH_AI     Structured SSE
 
-Streaming-Events der neuen API:
-  event: content  → data: {"content": "..."}    Text-Chunk
-  event: result   → data: {"aiRecord": {...}}   Abschluss-Metadaten
-  event: done     → data: {"message": "..."}    Stream beendet
-  event: error    → data: {"error": "..."}       Fehler
+Streaming events of the new API:
+  event: content  → data: {"content": "..."}    Text chunk
+  event: result   → data: {"aiRecord": {...}}   Final metadata
+  event: done     → data: {"message": "..."}    Stream finished
+  event: error    → data: {"error": "..."}      Error
 """
 
 from dotenv import load_dotenv
@@ -46,7 +46,7 @@ coloredlogs.install(level=os.getenv("LOG_LEVEL", "DEBUG"), logger=logger)
 
 
 # ---------------------------------------------------------------------------
-# Token-Zählung
+# Token counting
 # ---------------------------------------------------------------------------
 def calculate_token(text: str, model: str = "DEFAULT") -> int:
     try:
@@ -71,14 +71,14 @@ def _init_limiter() -> Limiter:
         c.set("_probe", "1")
         if c.get("_probe") == b"1":
             c.delete("_probe")
-            logger.info("Rate Limiter: Memcached-Backend (%s:%d)", host, port)
+            logger.info("Rate limiter: Memcached backend (%s:%d)", host, port)
             return Limiter(
                 get_remote_address, app=app,
                 storage_uri=f"memcached://{host}:{port}",
             )
     except Exception:
         pass
-    logger.warning("Memcached nicht erreichbar — In-Memory Rate Limiting (nicht für Produktion)")
+    logger.warning("Memcached unavailable — falling back to in-memory rate limiting (not suitable for production)")
     return Limiter(get_remote_address, app=app)
 
 
@@ -86,7 +86,7 @@ limiter = _init_limiter()
 
 
 # ---------------------------------------------------------------------------
-# 1min.ai Endpunkte (neue Chat-API)
+# 1min.ai endpoints (new Chat API)
 # ---------------------------------------------------------------------------
 ONEMIN_CHAT_URL        = "https://api.1min.ai/api/chat-with-ai"
 ONEMIN_CHAT_STREAM_URL = "https://api.1min.ai/api/chat-with-ai?isStreaming=true"
@@ -94,7 +94,7 @@ ONEMIN_ASSET_URL       = "https://api.1min.ai/api/assets"
 
 
 # ---------------------------------------------------------------------------
-# Modell-Listen
+# Model lists
 # ---------------------------------------------------------------------------
 ALL_MODELS = [
     # --- Alibaba ---
@@ -169,7 +169,7 @@ AVAILABLE_MODELS  = PERMITTED_MODELS if RESTRICT_MODELS else ALL_MODELS
 
 
 # ---------------------------------------------------------------------------
-# Hilfsfunktionen
+# Helpers
 # ---------------------------------------------------------------------------
 def extract_api_key() -> str | None:
     auth = request.headers.get("Authorization", "")
@@ -185,7 +185,7 @@ def openai_error(message: str, error_type: str, code: str | None, http_status: i
 
 
 def messages_to_prompt(messages: list) -> str:
-    """Wandelt das OpenAI-Messages-Array in einen flachen Prompt-String um."""
+    """Converts the OpenAI messages array into a flat prompt string."""
     parts = []
     for msg in messages:
         role = msg.get("role", "").capitalize()
@@ -205,7 +205,7 @@ def messages_to_prompt(messages: list) -> str:
 
 
 def upload_image(url_or_b64: str, api_key: str) -> str | None:
-    """Lädt ein Bild zur 1min.ai Asset-API hoch und gibt den Asset-Pfad zurück."""
+    """Uploads an image to the 1min.ai Asset API and returns the asset path."""
     try:
         if url_or_b64.startswith("data:image/"):
             binary_io = BytesIO(base64.b64decode(url_or_b64.split(",", 1)[1]))
@@ -222,12 +222,12 @@ def upload_image(url_or_b64: str, api_key: str) -> str | None:
         resp.raise_for_status()
         return resp.json()["fileContent"]["path"]
     except Exception as exc:
-        logger.warning("Bild-Upload fehlgeschlagen: %s", str(exc)[:120])
+        logger.warning("Image upload failed: %s", str(exc)[:120])
         return None
 
 
 def build_payload(model: str, prompt: str, image_paths: list[str]) -> dict:
-    """Erstellt den Request-Body für UNIFY_CHAT_WITH_AI."""
+    """Builds the request body for UNIFY_CHAT_WITH_AI."""
     prompt_obj: dict = {
         "prompt": prompt,
         "settings": {
@@ -254,7 +254,7 @@ def transform_nonstream(api_resp: dict, model: str, prompt_tokens: int) -> dict:
     result = api_resp["aiRecord"]["aiRecordDetail"]["resultObject"][0]
     completion_tokens = calculate_token(result)
     logger.debug(
-        "Non-streaming abgeschlossen — %dp + %dc = %d tokens",
+        "Non-streaming complete — %dp + %dc = %d tokens",
         prompt_tokens, completion_tokens, prompt_tokens + completion_tokens,
     )
     return {
@@ -277,12 +277,12 @@ def transform_nonstream(api_resp: dict, model: str, prompt_tokens: int) -> dict:
 
 def stream_response(http_resp, model: str, prompt_tokens: int):
     """
-    Parst die strukturierten SSE-Events der neuen 1min.ai Chat-API und gibt
-    sie im OpenAI-kompatiblen Streaming-Format weiter.
+    Parses the structured SSE events from the new 1min.ai Chat API and forwards
+    them in OpenAI-compatible streaming format.
 
-    Die neue API sendet benannte Events (event: content / result / done / error).
-    Das ist fundamental anders als der alte Rohtextstream der Feature-API.
-    iter_lines() überspringt Leerzeilen zwischen Events automatisch.
+    The new API sends named events (event: content / result / done / error),
+    which is fundamentally different from the raw byte stream of the legacy API.
+    iter_lines() skips blank lines between events automatically.
     """
     all_text = ""
     current_event: str | None = None
@@ -317,20 +317,20 @@ def stream_response(http_resp, model: str, prompt_tokens: int):
                 break
 
             elif current_event == "error":
-                logger.error("1min.ai Stream-Fehler: %s", data_str)
+                logger.error("1min.ai stream error: %s", data_str)
                 break
 
-            # "result"-Event enthält nur Metadaten — ignorieren
+            # "result" event contains only metadata — ignore
 
             current_event = None  # Reset nach jedem data:-Block
 
     completion_tokens = calculate_token(all_text)
     logger.debug(
-        "Streaming abgeschlossen — %dp + %dc = %d tokens",
+        "Streaming complete — %dp + %dc = %d tokens",
         prompt_tokens, completion_tokens, prompt_tokens + completion_tokens,
     )
 
-    # Abschluss-Chunk mit finish_reason und usage
+    # Final chunk with finish_reason and usage
     yield f"data: {json.dumps({
         'id': completion_id,
         'object': 'chat.completion.chunk',
@@ -356,7 +356,7 @@ def index():
     return (
         f"1min-proxy\n"
         f"  Endpoint: {ip}:{port}/v1\n"
-        f"  Modelle:  {ip}:{port}/v1/models\n"
+        f"  Models:   {ip}:{port}/v1/models\n"
     )
 
 
@@ -405,7 +405,7 @@ def chat_completions():
             "Last message has no content.", "invalid_request_error", "invalid_request_error", 400
         )
 
-    # --- Bilder aus dem letzten Message-Block extrahieren ---
+    # --- Extract images from the last message block ---
     image_paths: list[str] = []
     if isinstance(last_content, list):
         for item in last_content:
@@ -439,7 +439,7 @@ def chat_completions():
                 )
             resp.raise_for_status()
         except requests.exceptions.HTTPError as exc:
-            logger.error("1min.ai HTTP-Fehler: %s", exc)
+            logger.error("1min.ai HTTP error: %s", exc)
             return jsonify({"error": {"message": str(exc)}}), 502
 
         result    = transform_nonstream(resp.json(), model, prompt_tokens)
@@ -462,7 +462,7 @@ def chat_completions():
                 )
             stream_resp.raise_for_status()
         except requests.exceptions.RequestException as exc:
-            logger.error("Stream-Anfrage fehlgeschlagen: %s", exc)
+            logger.error("Streaming request failed: %s", exc)
             return jsonify({"error": {"message": str(exc)}}), 502
 
         return Response(
@@ -481,7 +481,7 @@ if __name__ == "__main__":
 
     ip = socket.gethostbyname(socket.gethostname())
     logger.info(
-        "\n1min-proxy bereit\n  http://%s:%d/v1\n  http://%s:%d/v1/models\n",
+        "\n1min-proxy ready\n  http://%s:%d/v1\n  http://%s:%d/v1/models\n",
         ip, PORT, ip, PORT,
     )
     serve(app, host=HOST, port=PORT, threads=THREADS)
