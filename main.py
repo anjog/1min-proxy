@@ -318,7 +318,7 @@ def build_payload(model: str, prompt: str, image_paths: list[str]) -> dict:
 # Function-Calling Emulation
 # ===========================================================================
 
-def build_tool_system_prompt(tools: list) -> str:
+def build_tool_system_prompt(tools: list, tool_choice=None) -> str:
     """
     Serializes the OpenAI tools array into a system-prompt block.
     The model is instructed to output tool calls in a specific XML+JSON format
@@ -328,6 +328,11 @@ def build_tool_system_prompt(tools: list) -> str:
     - Anthropic models produce this natively when instructed
     - OpenAI models reliably follow explicit format instructions
     - DeepSeek models respond well to XML-delimited output instructions
+
+    tool_choice influences the mandatory/optional call instruction:
+      "auto" / None  → model decides (default)
+      "required"     → model MUST call a tool
+      {"type": "function", "function": {"name": "..."}} → must call that specific tool
     """
     tool_descriptions = []
     for tool in tools:
@@ -342,6 +347,23 @@ def build_tool_system_prompt(tools: list) -> str:
 
     tools_block = "\n".join(tool_descriptions)
 
+    if tool_choice == "required":
+        call_instruction = (
+            "- You MUST call one of the available tools. "
+            "Do NOT respond with plain text — always output a <tool_call> block."
+        )
+    elif isinstance(tool_choice, dict):
+        forced_name = tool_choice.get("function", {}).get("name", "")
+        if forced_name:
+            call_instruction = (
+                f"- You MUST call the '{forced_name}' tool. "
+                "Do NOT call any other tool and do NOT respond with plain text."
+            )
+        else:
+            call_instruction = "- If no tool call is needed, respond normally without any <tool_call> block."
+    else:
+        call_instruction = "- If no tool call is needed, respond normally without any <tool_call> block."
+
     return f"""You have access to the following tools:
 
 {tools_block}
@@ -353,16 +375,16 @@ TOOL CALL INSTRUCTIONS (mandatory):
   {{"name": "TOOL_NAME", "arguments": {{...}}}}
   </tool_call>
 - The JSON inside <tool_call> must be valid. Use double quotes. No trailing commas.
-- If no tool call is needed, respond normally without any <tool_call> block."""
+{call_instruction}"""
 
 
-def inject_tools_into_messages(messages: list, tools: list) -> list:
+def inject_tools_into_messages(messages: list, tools: list, tool_choice=None) -> list:
     """
     Prepends the tool description block to the system message, or inserts
     a new system message at position 0 if none exists.
     Returns a new messages list — does not mutate the original.
     """
-    tool_prompt = build_tool_system_prompt(tools)
+    tool_prompt = build_tool_system_prompt(tools, tool_choice)
     patched = []
     injected = False
 
@@ -789,9 +811,10 @@ def chat_completions():
         return openai_error("Missing API key.", "authentication_error", None, 401)
 
     body = request.json or {}
-    model    = body.get("model", DEFAULT_MODEL)
-    messages = body.get("messages", [])
-    tools    = body.get("tools") or []          # OpenAI tools array (may be absent)
+    model       = body.get("model", DEFAULT_MODEL)
+    messages    = body.get("messages", [])
+    tools       = body.get("tools") or []          # OpenAI tools array (may be absent)
+    tool_choice = body.get("tool_choice", "auto")  # "auto" | "none" | "required" | {..}
 
     if not messages:
         return openai_error(
@@ -809,9 +832,15 @@ def chat_completions():
         )
 
     # --- Function-Calling Emulation: inject tool descriptions into messages ---
-    if tools:
-        logger.debug("FC-Emulation: %d tool(s) detected, injecting into system prompt", len(tools))
-        messages = inject_tools_into_messages(messages, tools)
+    if tools and tool_choice != "none":
+        logger.debug(
+            "FC-Emulation: %d tool(s) detected, tool_choice=%r, injecting into system prompt",
+            len(tools), tool_choice,
+        )
+        messages = inject_tools_into_messages(messages, tools, tool_choice)
+    elif tools and tool_choice == "none":
+        logger.debug("FC-Emulation: tool_choice=none — skipping tool injection")
+        tools = []  # Treat as tool-free request for response parsing too
 
     # --- Extract images from the last message block ---
     image_paths: list[str] = []
