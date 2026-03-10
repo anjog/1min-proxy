@@ -59,7 +59,12 @@ warnings.filterwarnings("ignore", category=UserWarning, module="flask_limiter.ex
 # Logging
 # ---------------------------------------------------------------------------
 logger = logging.getLogger("1min-proxy")
-coloredlogs.install(level=os.getenv("LOG_LEVEL", "DEBUG"), logger=logger)
+coloredlogs.install(
+    level=os.getenv("LOG_LEVEL", "INFO"),
+    logger=logger,
+    fmt="%(asctime)s %(levelname)s %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+)
 
 
 # ---------------------------------------------------------------------------
