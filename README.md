@@ -13,6 +13,7 @@ A standalone reimplementation based on [1min-relay](https://github.com/kokofixco
 
 - OpenAI-compatible endpoints (`/v1/chat/completions`, `/v1/models`)
 - Streaming (structured SSE events of the new API) and non-streaming
+- **Function-calling emulation** — 1min.ai has no native tool support; the proxy emulates it transparently via prompt injection and response parsing, including `tool_choice` and multi-turn tool loops
 - Image uploads via 1min.ai Asset API (vision models)
 - Model whitelist via environment variable
 - Rate limiting (Memcached or in-memory)
@@ -87,6 +88,27 @@ curl http://localhost:5001/v1/chat/completions \
     "model": "deepseek-chat",
     "stream": true,
     "messages": [{"role": "user", "content": "Hello!"}]
+  }'
+
+# Function calling (emulated — works with all models)
+curl http://localhost:5001/v1/chat/completions \
+  -H "Authorization: Bearer YOUR_1MIN_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "deepseek-chat",
+    "messages": [{"role": "user", "content": "What is the weather in Berlin?"}],
+    "tools": [{
+      "type": "function",
+      "function": {
+        "name": "get_weather",
+        "description": "Get current weather for a location",
+        "parameters": {
+          "type": "object",
+          "properties": {"location": {"type": "string"}},
+          "required": ["location"]
+        }
+      }
+    }]
   }'
 ```
 
