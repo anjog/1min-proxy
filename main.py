@@ -13,6 +13,18 @@ Streaming events of the new API:
   event: result   → data: {"aiRecord": {...}}   Final metadata
   event: done     → data: {"message": "..."}    Stream finished
   event: error    → data: {"error": "..."}      Error
+
+Function-Calling Emulation (added 2026-03):
+  1min.ai does not support native OpenAI function calling.
+  When tools are present in the request, this proxy:
+    1. Injects a structured tool description block into the system prompt
+    2. Instructs the model to respond with a specific XML/JSON format when calling a tool
+    3. Parses the model response for tool call patterns
+    4. Transforms detected tool calls into the OpenAI tool_calls response format
+  Supported output patterns (model-dependent):
+    Anthropic:  <tool_call>{"name": "...", "arguments": {...}}</tool_call>
+    OpenAI/DS:  {"tool_call": {"name": "...", "arguments": {...}}}
+                <function_calls><invoke name="..."><parameter ...>
 """
 
 from dotenv import load_dotenv
@@ -23,6 +35,7 @@ import requests
 import time
 import uuid
 import json
+import re
 import socket
 import os
 import logging
@@ -60,6 +73,7 @@ def calculate_token(text: str, model: str = "DEFAULT") -> int:
 # Flask + Rate Limiter
 # ---------------------------------------------------------------------------
 app = Flask(__name__)
+app.config["JSON_AS_ASCII"] = False
 
 
 def _init_limiter() -> Limiter:
@@ -78,7 +92,7 @@ def _init_limiter() -> Limiter:
             )
     except Exception:
         pass
-    logger.warning("Memcached unavailable — falling back to in-memory rate limiting (not suitable for production)")
+    logger.warning("Memcached unavailable — falling back to in-memory rate limiting")
     return Limiter(get_remote_address, app=app)
 
 
@@ -247,16 +261,245 @@ def build_payload(model: str, prompt: str, image_paths: list[str]) -> dict:
     }
 
 
+# ===========================================================================
+# Function-Calling Emulation
+# ===========================================================================
+
+def build_tool_system_prompt(tools: list) -> str:
+    """
+    Serializes the OpenAI tools array into a system-prompt block.
+    The model is instructed to output tool calls in a specific XML+JSON format
+    that is unambiguous and parseable across Anthropic, OpenAI, and DeepSeek models.
+
+    Format chosen: <tool_call>{"name": "...", "arguments": {...}}</tool_call>
+    - Anthropic models produce this natively when instructed
+    - OpenAI models reliably follow explicit format instructions
+    - DeepSeek models respond well to XML-delimited output instructions
+    """
+    tool_descriptions = []
+    for tool in tools:
+        # Tools can be bare function dicts or wrapped in {"type": "function", "function": {...}}
+        fn = tool.get("function", tool)
+        name = fn.get("name", "")
+        description = fn.get("description", "")
+        params = fn.get("parameters", {})
+        tool_descriptions.append(
+            f"- {name}: {description}\n  Parameters: {json.dumps(params, ensure_ascii=False)}"
+        )
+
+    tools_block = "\n".join(tool_descriptions)
+
+    return f"""You have access to the following tools:
+
+{tools_block}
+
+TOOL CALL INSTRUCTIONS (mandatory):
+- When you need to call a tool, respond ONLY with a tool call block — no surrounding text.
+- Use this exact format:
+  <tool_call>
+  {{"name": "TOOL_NAME", "arguments": {{...}}}}
+  </tool_call>
+- The JSON inside <tool_call> must be valid. Use double quotes. No trailing commas.
+- If no tool call is needed, respond normally without any <tool_call> block."""
+
+
+def inject_tools_into_messages(messages: list, tools: list) -> list:
+    """
+    Prepends the tool description block to the system message, or inserts
+    a new system message at position 0 if none exists.
+    Returns a new messages list — does not mutate the original.
+    """
+    tool_prompt = build_tool_system_prompt(tools)
+    patched = []
+    injected = False
+
+    for msg in messages:
+        if msg.get("role") == "system" and not injected:
+            # Append to existing system message
+            existing = msg.get("content", "")
+            patched.append({**msg, "content": f"{existing}\n\n{tool_prompt}"})
+            injected = True
+        else:
+            patched.append(msg)
+
+    if not injected:
+        # No system message present — prepend one
+        patched.insert(0, {"role": "system", "content": tool_prompt})
+
+    return patched
+
+
+def parse_tool_calls(text: str) -> list | None:
+    """
+    Scans model output for tool call patterns and returns an OpenAI-compatible
+    tool_calls list, or None if no tool call was detected.
+
+    Patterns handled (in order of priority):
+      1. <tool_call>{...}</tool_call>         — Anthropic-style (primary target)
+      2. {"tool_call": {"name":..,"arguments":..}} — OpenAI plain JSON fallback
+      3. <function_calls><invoke name="...">  — Legacy Anthropic XML format
+      4. DeepSeek <|tool▁call▁begin|> tokens — DeepSeek native format
+    """
+    tool_calls = []
+
+    # --- Pattern 1: <tool_call>{...}</tool_call> (instructed format, all models) ---
+    for match in re.finditer(
+        r"<tool_call>\s*(\{.*?\})\s*</tool_call>",
+        text,
+        re.DOTALL,
+    ):
+        try:
+            data = json.loads(match.group(1))
+            name = data.get("name", "")
+            arguments = data.get("arguments", {})
+            if name:
+                tool_calls.append(_make_tool_call(name, arguments))
+                logger.debug("FC-Emulation: pattern 1 (xml+json) → %s", name)
+        except json.JSONDecodeError as exc:
+            logger.warning("FC-Emulation: JSON parse error in pattern 1: %s", exc)
+
+    if tool_calls:
+        return tool_calls
+
+    # --- Pattern 2: {"tool_call": {"name": ..., "arguments": ...}} ---
+    for match in re.finditer(
+        r'\{\s*"tool_call"\s*:\s*\{[^}]*"name"\s*:\s*"([^"]+)"[^}]*"arguments"\s*:\s*(\{.*?\})',
+        text,
+        re.DOTALL,
+    ):
+        try:
+            name = match.group(1)
+            arguments = json.loads(match.group(2))
+            tool_calls.append(_make_tool_call(name, arguments))
+            logger.debug("FC-Emulation: pattern 2 (plain json) → %s", name)
+        except json.JSONDecodeError as exc:
+            logger.warning("FC-Emulation: JSON parse error in pattern 2: %s", exc)
+
+    if tool_calls:
+        return tool_calls
+
+    # --- Pattern 3: <function_calls><invoke name="..."> (legacy Anthropic XML) ---
+    for match in re.finditer(
+        r'<invoke\s+name="([^"]+)">(.*?)</invoke>',
+        text,
+        re.DOTALL,
+    ):
+        try:
+            name = match.group(1)
+            # Parameters are encoded as <parameter name="key">value</parameter>
+            params_raw = match.group(2)
+            arguments = {}
+            for param in re.finditer(
+                r'<parameter\s+name="([^"]+)">(.*?)</parameter>',
+                params_raw,
+                re.DOTALL,
+            ):
+                key = param.group(1)
+                value = param.group(2).strip()
+                # Try to parse as JSON, fall back to string
+                try:
+                    arguments[key] = json.loads(value)
+                except json.JSONDecodeError:
+                    arguments[key] = value
+            tool_calls.append(_make_tool_call(name, arguments))
+            logger.debug("FC-Emulation: pattern 3 (legacy xml) → %s", name)
+        except Exception as exc:
+            logger.warning("FC-Emulation: parse error in pattern 3: %s", exc)
+
+    if tool_calls:
+        return tool_calls
+
+    # --- Pattern 4: DeepSeek <|tool▁call▁begin|> format ---
+    # DeepSeek R1/V3 uses Unicode "word joiner" chars in its tool tags
+    for match in re.finditer(
+        r"<\|tool[▁\s]call[▁\s]begin\|>(.*?)<\|tool[▁\s]call[▁\s]end\|>",
+        text,
+        re.DOTALL,
+    ):
+        try:
+            data = json.loads(match.group(1).strip())
+            name = data.get("name", "")
+            arguments = data.get("arguments", data.get("parameters", {}))
+            if name:
+                tool_calls.append(_make_tool_call(name, arguments))
+                logger.debug("FC-Emulation: pattern 4 (deepseek) → %s", name)
+        except json.JSONDecodeError as exc:
+            logger.warning("FC-Emulation: JSON parse error in pattern 4: %s", exc)
+
+    return tool_calls if tool_calls else None
+
+
+def _make_tool_call(name: str, arguments: dict | str) -> dict:
+    """Builds a single OpenAI-format tool_call dict."""
+    # arguments must be a JSON string in the OpenAI format
+    if isinstance(arguments, str):
+        args_str = arguments
+    else:
+        args_str = json.dumps(arguments, ensure_ascii=False)
+    return {
+        "id": f"call_{uuid.uuid4().hex[:24]}",  # OpenAI uses 24-char hex IDs
+        "type": "function",
+        "function": {
+            "name": name,
+            "arguments": args_str,
+        },
+    }
+
+
+def wrap_tool_calls_response(text: str, tool_calls: list, model: str, prompt_tokens: int) -> dict:
+    """
+    Builds a complete OpenAI chat.completion response with tool_calls.
+    content is set to None per OpenAI spec when tool_calls are present.
+    finish_reason is set to "tool_calls" instead of "stop".
+    """
+    completion_tokens = calculate_token(text)
+    logger.info(
+        "FC-Emulation: returning %d tool call(s) for model %s", len(tool_calls), model
+    )
+    return {
+        "id": f"chatcmpl-{uuid.uuid4()}",
+        "object": "chat.completion",
+        "created": int(time.time()),
+        "model": model,
+        "choices": [{
+            "index": 0,
+            "message": {
+                "role": "assistant",
+                "content": None,          # None per OpenAI spec when tool_calls present
+                "tool_calls": tool_calls,
+            },
+            "finish_reason": "tool_calls",  # Signals to caller that tools need execution
+        }],
+        "usage": {
+            "prompt_tokens": prompt_tokens,
+            "completion_tokens": completion_tokens,
+            "total_tokens": prompt_tokens + completion_tokens,
+        },
+    }
+
+
 # ---------------------------------------------------------------------------
 # Response-Transformer
 # ---------------------------------------------------------------------------
-def transform_nonstream(api_resp: dict, model: str, prompt_tokens: int) -> dict:
+def transform_nonstream(
+    api_resp: dict,
+    model: str,
+    prompt_tokens: int,
+    tools: list | None = None,
+) -> dict:
     result = api_resp["aiRecord"]["aiRecordDetail"]["resultObject"][0]
     completion_tokens = calculate_token(result)
     logger.debug(
         "Non-streaming complete — %dp + %dc = %d tokens",
         prompt_tokens, completion_tokens, prompt_tokens + completion_tokens,
     )
+
+    # --- Function-Calling Emulation: check response for tool calls ---
+    if tools:
+        detected = parse_tool_calls(result)
+        if detected:
+            return wrap_tool_calls_response(result, detected, model, prompt_tokens)
+
     return {
         "id": f"chatcmpl-{uuid.uuid4()}",
         "object": "chat.completion",
@@ -275,21 +518,25 @@ def transform_nonstream(api_resp: dict, model: str, prompt_tokens: int) -> dict:
     }
 
 
-def stream_response(http_resp, model: str, prompt_tokens: int):
+def stream_response(http_resp, model: str, prompt_tokens: int, tools: list | None = None):
     """
     Parses the structured SSE events from the new 1min.ai Chat API and forwards
     them in OpenAI-compatible streaming format.
 
-    The new API sends named events (event: content / result / done / error),
-    which is fundamentally different from the raw byte stream of the legacy API.
-    iter_lines() skips blank lines between events automatically.
+    When tools are present, the full response is buffered first, then parsed
+    for tool calls. If a tool call is detected, a single non-streaming-style
+    chunk with tool_calls is emitted instead of content chunks.
+
+    Note: OpenAI's streaming spec supports tool_calls in delta chunks, but
+    most clients (including OpenClaw) handle the simpler single-chunk approach.
     """
     all_text = ""
     current_event: str | None = None
     completion_id = f"chatcmpl-{uuid.uuid4()}"
     created = int(time.time())
 
-    for raw_line in http_resp.iter_lines(decode_unicode=True):
+    for raw_line_bytes in http_resp.iter_lines():
+        raw_line = raw_line_bytes.decode("utf-8") if isinstance(raw_line_bytes, bytes) else raw_line_bytes
         if raw_line.startswith("event:"):
             current_event = raw_line[6:].strip()
 
@@ -304,14 +551,18 @@ def stream_response(http_resp, model: str, prompt_tokens: int):
 
                 if chunk:
                     all_text += chunk
-                    yield f"data: {json.dumps({
-                        'id': completion_id,
-                        'object': 'chat.completion.chunk',
-                        'created': created,
-                        'model': model,
-                        'choices': [{'index': 0, 'delta': {'content': chunk},
-                                     'finish_reason': None}],
-                    })}\n\n"
+
+                    # Only stream chunks to client when NOT in tool-emulation mode
+                    # (tool mode buffers the full response for parsing)
+                    if not tools:
+                        yield f"data: {json.dumps({
+                            'id': completion_id,
+                            'object': 'chat.completion.chunk',
+                            'created': created,
+                            'model': model,
+                            'choices': [{'index': 0, 'delta': {'content': chunk},
+                                         'finish_reason': None}],
+                        }, ensure_ascii=False)}\n\n"
 
             elif current_event == "done":
                 break
@@ -320,9 +571,7 @@ def stream_response(http_resp, model: str, prompt_tokens: int):
                 logger.error("1min.ai stream error: %s", data_str)
                 break
 
-            # "result" event contains only metadata — ignore
-
-            current_event = None  # Reset nach jedem data:-Block
+            current_event = None  # Reset after each data: block
 
     completion_tokens = calculate_token(all_text)
     logger.debug(
@@ -330,7 +579,46 @@ def stream_response(http_resp, model: str, prompt_tokens: int):
         prompt_tokens, completion_tokens, prompt_tokens + completion_tokens,
     )
 
-    # Final chunk with finish_reason and usage
+    # --- Function-Calling Emulation: parse buffered response ---
+    if tools:
+        detected = parse_tool_calls(all_text)
+        if detected:
+            # Emit a single chunk with tool_calls (finish_reason: tool_calls)
+            tool_chunk = {
+                "id": completion_id,
+                "object": "chat.completion.chunk",
+                "created": created,
+                "model": model,
+                "choices": [{
+                    "index": 0,
+                    "delta": {
+                        "role": "assistant",
+                        "content": None,
+                        "tool_calls": detected,
+                    },
+                    "finish_reason": "tool_calls",
+                }],
+                "usage": {
+                    "prompt_tokens": prompt_tokens,
+                    "completion_tokens": completion_tokens,
+                    "total_tokens": prompt_tokens + completion_tokens,
+                },
+            }
+            yield f"data: {json.dumps(tool_chunk, ensure_ascii=False)}\n\n"
+            yield "data: [DONE]\n\n"
+            return
+
+        # No tool call detected — emit buffered text as single chunk
+        yield f"data: {json.dumps({
+            'id': completion_id,
+            'object': 'chat.completion.chunk',
+            'created': created,
+            'model': model,
+            'choices': [{'index': 0, 'delta': {'content': all_text},
+                         'finish_reason': None}],
+        }, ensure_ascii=False)}\n\n"
+
+    # Final chunk with finish_reason=stop and usage
     yield f"data: {json.dumps({
         'id': completion_id,
         'object': 'chat.completion.chunk',
@@ -342,7 +630,7 @@ def stream_response(http_resp, model: str, prompt_tokens: int):
             'completion_tokens': completion_tokens,
             'total_tokens': prompt_tokens + completion_tokens,
         },
-    })}\n\n"
+    }, ensure_ascii=False)}\n\n"
     yield "data: [DONE]\n\n"
 
 
@@ -389,6 +677,7 @@ def chat_completions():
     body = request.json or {}
     model    = body.get("model", DEFAULT_MODEL)
     messages = body.get("messages", [])
+    tools    = body.get("tools") or []          # OpenAI tools array (may be absent)
 
     if not messages:
         return openai_error(
@@ -405,6 +694,11 @@ def chat_completions():
             "Last message has no content.", "invalid_request_error", "invalid_request_error", 400
         )
 
+    # --- Function-Calling Emulation: inject tool descriptions into messages ---
+    if tools:
+        logger.debug("FC-Emulation: %d tool(s) detected, injecting into system prompt", len(tools))
+        messages = inject_tools_into_messages(messages, tools)
+
     # --- Extract images from the last message block ---
     image_paths: list[str] = []
     if isinstance(last_content, list):
@@ -419,12 +713,16 @@ def chat_completions():
                 if path:
                     image_paths.append(path)
 
-    prompt       = messages_to_prompt(messages)
+    prompt        = messages_to_prompt(messages)
     prompt_tokens = calculate_token(prompt, model)
-    payload      = build_payload(model, prompt, image_paths)
-    headers      = {"API-KEY": api_key, "Content-Type": "application/json"}
+    payload       = build_payload(model, prompt, image_paths)
+    logger.debug("PROMPT_TAIL: %s", prompt[-2000:])
+    headers       = {"API-KEY": api_key, "Content-Type": "application/json; charset=utf-8"}
 
-    logger.debug("→ %s | %d prompt-tokens | stream=%s", model, prompt_tokens, body.get("stream"))
+    logger.debug(
+        "→ %s | %d prompt-tokens | stream=%s | tools=%d",
+        model, prompt_tokens, body.get("stream"), len(tools),
+    )
 
     if not body.get("stream", False):
         # Non-Streaming
@@ -442,9 +740,9 @@ def chat_completions():
             logger.error("1min.ai HTTP error: %s", exc)
             return jsonify({"error": {"message": str(exc)}}), 502
 
-        result    = transform_nonstream(resp.json(), model, prompt_tokens)
+        result     = transform_nonstream(resp.json(), model, prompt_tokens, tools or None)
         flask_resp = make_response(jsonify(result))
-        flask_resp.headers["Content-Type"] = "application/json"
+        flask_resp.headers["Content-Type"] = "application/json; charset=utf-8"
         flask_resp.headers["Access-Control-Allow-Origin"] = "*"
         return flask_resp, 200
 
@@ -466,7 +764,7 @@ def chat_completions():
             return jsonify({"error": {"message": str(exc)}}), 502
 
         return Response(
-            stream_response(stream_resp, model, prompt_tokens),
+            stream_response(stream_resp, model, prompt_tokens, tools or None),
             content_type="text/event-stream",
         )
 
