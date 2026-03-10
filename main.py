@@ -22,9 +22,13 @@ Function-Calling Emulation (added 2026-03):
     3. Parses the model response for tool call patterns
     4. Transforms detected tool calls into the OpenAI tool_calls response format
   Supported output patterns (model-dependent):
-    Anthropic:  <tool_call>{"name": "...", "arguments": {...}}</tool_call>
-    OpenAI/DS:  {"tool_call": {"name": "...", "arguments": {...}}}
-                <function_calls><invoke name="..."><parameter ...>
+    All models: <tool_call>{"name": "...", "arguments": {...}}</tool_call>  (instructed)
+    Anthropic:  <function_calls><invoke name="..."><parameter ...>  (legacy XML)
+    OpenAI:     {"tool_call": {"name": "...", "arguments": {...}}}  (JSON fallback)
+    DeepSeek:   <|tool▁call▁begin|>{...}<|tool▁call▁end|>
+    Mistral:    [TOOL_CALLS] [{"name": "...", "arguments": {...}}]
+    Llama/Sonar: <|python_tag|>{"name": "...", "parameters": {...}}
+    Qwen (old): ✿FUNCTION✿: name ✿ARGS✿: {...}
 """
 
 from dotenv import load_dotenv
@@ -384,10 +388,13 @@ def parse_tool_calls(text: str) -> list | None:
     tool_calls list, or None if no tool call was detected.
 
     Patterns handled (in order of priority):
-      1. <tool_call>{...}</tool_call>         — Anthropic-style (primary target)
+      1. <tool_call>{...}</tool_call>              — instructed format (all models)
       2. {"tool_call": {"name":..,"arguments":..}} — OpenAI plain JSON fallback
-      3. <function_calls><invoke name="...">  — Legacy Anthropic XML format
-      4. DeepSeek <|tool▁call▁begin|> tokens — DeepSeek native format
+      3. <function_calls><invoke name="...">       — legacy Anthropic XML
+      4. <|tool▁call▁begin|>...<|tool▁call▁end|>  — DeepSeek native tokens
+      5. [TOOL_CALLS] [{...}]                      — Mistral native format
+      6. <|python_tag|>{...}                       — Llama 3.1+ / Perplexity Sonar
+      7. ✿FUNCTION✿: name ✿ARGS✿: {...}           — Qwen (older checkpoints)
     """
     tool_calls = []
 
@@ -474,6 +481,64 @@ def parse_tool_calls(text: str) -> list | None:
                 logger.debug("FC-Emulation: pattern 4 (deepseek) → %s", name)
         except json.JSONDecodeError as exc:
             logger.warning("FC-Emulation: JSON parse error in pattern 4: %s", exc)
+
+    # --- Pattern 5: Mistral [TOOL_CALLS] [{...}] ---
+    # Mistral models output a JSON array after the [TOOL_CALLS] sentinel.
+    # Each element has "name" and "arguments".
+    for match in re.finditer(r"\[TOOL_CALLS\]\s*(\[.*?\])", text, re.DOTALL):
+        try:
+            calls = json.loads(match.group(1))
+            if not isinstance(calls, list):
+                calls = [calls]
+            for call in calls:
+                name = call.get("name", "")
+                arguments = call.get("arguments", call.get("parameters", {}))
+                if name:
+                    tool_calls.append(_make_tool_call(name, arguments))
+                    logger.debug("FC-Emulation: pattern 5 (mistral) → %s", name)
+        except json.JSONDecodeError as exc:
+            logger.warning("FC-Emulation: JSON parse error in pattern 5: %s", exc)
+
+    if tool_calls:
+        return tool_calls
+
+    # --- Pattern 6: Llama 3.1+ / Perplexity Sonar <|python_tag|>{...} ---
+    # Llama 3.1 uses <|python_tag|> as a prefix for tool/code calls.
+    # The JSON payload uses "parameters" instead of "arguments".
+    # End is marked by <|eom_id|> or another special token, or end of string.
+    for match in re.finditer(
+        r"<\|python_tag\|>(.*?)(?:<\|[a-z_]+\|>|$)",
+        text,
+        re.DOTALL,
+    ):
+        try:
+            data = json.loads(match.group(1).strip())
+            name = data.get("name", "")
+            arguments = data.get("parameters", data.get("arguments", {}))
+            if name:
+                tool_calls.append(_make_tool_call(name, arguments))
+                logger.debug("FC-Emulation: pattern 6 (llama) → %s", name)
+        except json.JSONDecodeError as exc:
+            logger.warning("FC-Emulation: JSON parse error in pattern 6: %s", exc)
+
+    if tool_calls:
+        return tool_calls
+
+    # --- Pattern 7: Qwen (older checkpoints) ✿FUNCTION✿ / ✿ARGS✿ ---
+    # Older Qwen models (pre-2.5) use a proprietary marker format.
+    # Qwen 2.5+ generally follows the instructed <tool_call> format instead.
+    for match in re.finditer(
+        r"✿FUNCTION✿:\s*(\S+)\s*✿ARGS✿:\s*(\{.*?\})",
+        text,
+        re.DOTALL,
+    ):
+        try:
+            name = match.group(1).strip()
+            arguments = json.loads(match.group(2))
+            tool_calls.append(_make_tool_call(name, arguments))
+            logger.debug("FC-Emulation: pattern 7 (qwen-old) → %s", name)
+        except json.JSONDecodeError as exc:
+            logger.warning("FC-Emulation: JSON parse error in pattern 7: %s", exc)
 
     return tool_calls if tool_calls else None
 
