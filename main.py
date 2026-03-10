@@ -199,18 +199,67 @@ def openai_error(message: str, error_type: str, code: str | None, http_status: i
 
 
 def messages_to_prompt(messages: list) -> str:
-    """Converts the OpenAI messages array into a flat prompt string."""
+    """
+    Converts the OpenAI messages array into a flat prompt string.
+
+    Handles multi-turn tool call sequences:
+      - assistant messages with tool_calls (content=None) are rendered back
+        in the instructed <tool_call> XML+JSON format so the model understands
+        what it previously called.
+      - role="tool" messages (tool results) are rendered as "Tool (name): result",
+        using a pre-built map of tool_call_id → tool_name for context.
+    """
+    # Pre-build map of tool_call_id → tool_name for tool result formatting
+    tool_call_map: dict[str, str] = {}
+    for msg in messages:
+        for tc in msg.get("tool_calls") or []:
+            tc_id = tc.get("id", "")
+            name = tc.get("function", {}).get("name", "")
+            if tc_id and name:
+                tool_call_map[tc_id] = name
+
     parts = []
     for msg in messages:
-        role = msg.get("role", "").capitalize()
-        content = msg.get("content", "")
+        role = msg.get("role", "")
+        content = msg.get("content") or ""
+
+        if role == "tool":
+            # Tool result — look up tool name via tool_call_id for context
+            tc_id = msg.get("tool_call_id", "")
+            tool_name = tool_call_map.get(tc_id, tc_id or "unknown")
+            if isinstance(content, list):
+                content = "\n".join(
+                    item.get("text", "")
+                    for item in content
+                    if isinstance(item, dict) and "text" in item
+                )
+            parts.append(f"Tool ({tool_name}): {content}")
+            continue
+
+        if role == "assistant":
+            tool_calls = msg.get("tool_calls")
+            if tool_calls and not content:
+                # Reproduce in the instructed XML+JSON format so the model
+                # recognises its own previous output when reading history
+                call_strs = []
+                for tc in tool_calls:
+                    fn = tc.get("function", {})
+                    name = fn.get("name", "")
+                    args = fn.get("arguments", "{}")
+                    call_strs.append(
+                        f'<tool_call>{{"name": "{name}", "arguments": {args}}}</tool_call>'
+                    )
+                parts.append(f"Assistant: {''.join(call_strs)}")
+                continue
+
         if isinstance(content, list):
             content = "\n".join(
                 item.get("text", "")
                 for item in content
                 if isinstance(item, dict) and "text" in item
             )
-        parts.append(f"{role}: {content}")
+        parts.append(f"{role.capitalize()}: {content}")
+
     if len(messages) > 1:
         parts.append(
             "\nRespond normally. Do NOT prefix output with 'User:' or 'Assistant:'."
