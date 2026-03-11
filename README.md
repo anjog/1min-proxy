@@ -15,6 +15,9 @@ A standalone reimplementation based on [1min-relay](https://github.com/kokofixco
 - Streaming (structured SSE events of the new API) and non-streaming
 - **Function-calling emulation** — 1min.ai has no native tool support; the proxy emulates it transparently via prompt injection and response parsing, including `tool_choice` and multi-turn tool loops
 - Image uploads via 1min.ai Asset API (vision models)
+- **Dynamic model registry** — fetches available models from the 1min.ai API on startup and refreshes every 5 minutes; falls back to a built-in list if the API is unreachable
+- **Credit cost logging** — estimates credit cost per request based on `creditMetadata` from the model API (`INPUT`/`OUTPUT` credits per 1,000 tokens)
+- **Model limit validation** — enforces `MAX_OUTPUT_TOKEN` and warns when the prompt exceeds the model's context window
 - Model whitelist via environment variable
 - Rate limiting (Memcached or in-memory)
 - Fully configurable via environment variables / `.env`
@@ -56,10 +59,11 @@ sudo systemctl enable --now 1min-proxy
 | `PROXY_HOST` | `0.0.0.0` | Bind address |
 | `PROXY_PORT` | `5001` | Port |
 | `PROXY_THREADS` | `6` | Waitress worker threads |
-| `DEFAULT_MODEL` | `deepseek-chat` | Model used when none is specified |
 | `LOG_LEVEL` | `INFO` | `DEBUG`, `INFO`, `WARNING`, `ERROR` |
-| `PERMITTED_MODELS` | *(all)* | Comma-separated model whitelist |
+| `PERMITTED_MODELS` | *(all)* | Comma-separated model whitelist (filters dynamic list) |
 | `RESTRICT_TO_PERMITTED` | `false` | Reject models not on the whitelist |
+| `ONEMIN_MODELS_URL` | `https://api.1min.ai/models` | 1min.ai Models API URL |
+| `MODEL_CACHE_TTL` | `300` | Model list cache duration in seconds |
 | `MEMCACHED_HOST` | `memcached` | Memcached host for rate limiting |
 | `MEMCACHED_PORT` | `11211` | Memcached port |
 

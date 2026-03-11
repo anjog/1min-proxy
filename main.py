@@ -42,6 +42,7 @@ import json
 import re
 import socket
 import os
+import threading
 import logging
 import base64
 from io import BytesIO
@@ -59,12 +60,27 @@ warnings.filterwarnings("ignore", category=UserWarning, module="flask_limiter.ex
 # Logging
 # ---------------------------------------------------------------------------
 logger = logging.getLogger("1min-proxy")
+logger.propagate = False
 coloredlogs.install(
     level=os.getenv("LOG_LEVEL", "INFO"),
     logger=logger,
     fmt="%(asctime)s %(levelname)s %(message)s",
     datefmt="%Y-%m-%d %H:%M:%S",
 )
+
+
+# ---------------------------------------------------------------------------
+# Crawling-line filter
+# ---------------------------------------------------------------------------
+_CRAWL_RE = re.compile(r"^🌐 Crawling site https?://[^\n]*\n?", re.MULTILINE)
+
+
+def strip_crawl_lines(text: str) -> str:
+    """Remove 1min.ai crawling status lines (e.g. '🌐 Crawling site <url>')."""
+    cleaned = _CRAWL_RE.sub("", text)
+    if cleaned != text:
+        logger.debug("Filtered 1min.ai crawl line(s) from response")
+    return cleaned
 
 
 # ---------------------------------------------------------------------------
@@ -76,6 +92,19 @@ def calculate_token(text: str, model: str = "DEFAULT") -> int:
     except KeyError:
         encoding = tiktoken.get_encoding("cl100k_base")
     return len(encoding.encode(text))
+
+
+def _log_credits(model: str, prompt_tokens: int, completion_tokens: int):
+    meta = _model_registry.get_model_meta(model)
+    if not meta:
+        return
+    cost = prompt_tokens * meta.get("INPUT", 0) / 1000 \
+         + completion_tokens * meta.get("OUTPUT", 0) / 1000
+    logger.info(
+        "Credits: %s | %d in + %d out = %d tokens | ~%.4f Credits",
+        model, prompt_tokens, completion_tokens,
+        prompt_tokens + completion_tokens, cost,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -119,7 +148,7 @@ ONEMIN_ASSET_URL       = "https://api.1min.ai/api/assets"
 # ---------------------------------------------------------------------------
 # Model lists
 # ---------------------------------------------------------------------------
-ALL_MODELS = [
+_FALLBACK_MODELS = [
     # --- Alibaba ---
     "qwen3-vl-plus", "qwen3-vl-flash", "qwen3-max",
     "qwen-vl-plus", "qwen-vl-max", "qwen-plus", "qwen-max", "qwen-flash",
@@ -170,7 +199,7 @@ ALL_MODELS = [
     "openai/gpt-oss-20b", "openai/gpt-oss-120b",
 ]
 
-VISION_MODELS = {
+_FALLBACK_VISION_MODELS = {
     "gpt-4o", "gpt-4o-mini", "gpt-4-turbo",
     "gpt-4.1", "gpt-4.1-mini",
     "gpt-5", "gpt-5-mini", "gpt-5.1", "gpt-5.2",
@@ -183,12 +212,92 @@ VISION_MODELS = {
     "qwen-vl-plus", "qwen-vl-max",
 }
 
-DEFAULT_MODEL = os.getenv("DEFAULT_MODEL", "deepseek-chat")
-
 _subset = os.getenv("PERMITTED_MODELS", "")
-PERMITTED_MODELS  = [m.strip() for m in _subset.split(",") if m.strip()] or ALL_MODELS
+_PERMITTED_MODELS = [m.strip() for m in _subset.split(",") if m.strip()]
 RESTRICT_MODELS   = os.getenv("RESTRICT_TO_PERMITTED", "false").lower() == "true"
-AVAILABLE_MODELS  = PERMITTED_MODELS if RESTRICT_MODELS else ALL_MODELS
+
+_MODELS_BASE_URL = os.getenv("ONEMIN_MODELS_URL", "https://api.1min.ai/models")
+_MODEL_CACHE_TTL = int(os.getenv("MODEL_CACHE_TTL", "300"))
+
+
+class ModelRegistry:
+    _FETCH_TIMEOUT = 8
+
+    def __init__(self, base_url, ttl, permitted):
+        self._base_url  = base_url
+        self._ttl       = ttl
+        self._permitted = permitted   # leere Liste = alle
+        self._lock      = threading.Lock()
+        self._all_models    = []
+        self._vision_models = set()
+        self._metadata      = {}   # modelId → creditMetadata dict
+        self._fetched_at    = 0.0
+        self._cache_valid   = False
+
+    def get_available_models(self) -> list[str]:
+        all_models = self._get_all_models()
+        if self._permitted:
+            permitted_set = set(self._permitted)
+            return [m for m in all_models if m in permitted_set]
+        return all_models
+
+    def get_model_meta(self, model: str) -> dict | None:
+        self._ensure_fresh()
+        return self._metadata.get(model)
+
+    def is_vision_model(self, model: str) -> bool:
+        self._ensure_fresh()
+        if self._cache_valid:
+            return model in self._vision_models
+        return model in _FALLBACK_VISION_MODELS
+
+    def refresh(self):
+        with self._lock:
+            self._fetch_and_store()
+
+    def _get_all_models(self):
+        self._ensure_fresh()
+        return list(self._all_models) if self._cache_valid else list(_FALLBACK_MODELS)
+
+    def _ensure_fresh(self):
+        if self._cache_valid and (time.monotonic() - self._fetched_at) < self._ttl:
+            return  # Fast path ohne Lock
+        with self._lock:
+            if self._cache_valid and (time.monotonic() - self._fetched_at) < self._ttl:
+                return
+            self._fetch_and_store()
+
+    def _fetch_and_store(self):
+        try:
+            chat_models = self._fetch_feature("UNIFY_CHAT_WITH_AI")
+            self._all_models    = [m["modelId"] for m in chat_models]
+            self._vision_models = {m["modelId"] for m in chat_models
+                                   if "CHAT_WITH_IMAGE" in m.get("features", [])}
+            self._metadata      = {m["modelId"]: m["creditMetadata"]
+                                   for m in chat_models if m.get("creditMetadata")}
+            self._fetched_at  = time.monotonic()
+            self._cache_valid = True
+            logger.info("ModelRegistry: %d Chat-Modelle, %d Vision-Modelle",
+                        len(self._all_models), len(self._vision_models))
+        except Exception as exc:
+            logger.warning("ModelRegistry: Fetch fehlgeschlagen (%s) — %s", exc,
+                           "nutze Stale-Cache" if self._cache_valid else "nutze Fallback-Liste")
+
+    def _fetch_feature(self, feature: str) -> list[dict]:
+        url  = f"{self._base_url}?feature={feature}"
+        resp = requests.get(url, timeout=self._FETCH_TIMEOUT)
+        resp.raise_for_status()
+        data = resp.json()
+        if not isinstance(data.get("models"), list):
+            raise ValueError(f"Unerwartetes API-Format für feature={feature}")
+        return data["models"]
+
+
+_model_registry = ModelRegistry(
+    base_url  = _MODELS_BASE_URL,
+    ttl       = _MODEL_CACHE_TTL,
+    permitted = _PERMITTED_MODELS,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -509,6 +618,9 @@ def parse_tool_calls(text: str) -> list | None:
         except json.JSONDecodeError as exc:
             logger.warning("FC-Emulation: JSON parse error in pattern 4: %s", exc)
 
+    if tool_calls:
+        return tool_calls
+
     # --- Pattern 5: Mistral [TOOL_CALLS] [{...}] ---
     # Mistral models output a JSON array after the [TOOL_CALLS] sentinel.
     # Each element has "name" and "arguments".
@@ -628,12 +740,25 @@ def transform_nonstream(
     prompt_tokens: int,
     tools: list | None = None,
 ) -> dict:
-    result = api_resp["aiRecord"]["aiRecordDetail"]["resultObject"][0]
+    try:
+        result = api_resp["aiRecord"]["aiRecordDetail"]["resultObject"][0]
+    except (KeyError, IndexError, TypeError) as exc:
+        logger.error("Unexpected 1min.ai response structure: %s", exc)
+        return {
+            "error": {
+                "message": "Unexpected upstream response structure.",
+                "type": "server_error",
+                "param": None,
+                "code": "upstream_error",
+            }
+        }
+    result = strip_crawl_lines(result)
     completion_tokens = calculate_token(result)
     logger.debug(
         "Non-streaming complete — %dp + %dc = %d tokens",
         prompt_tokens, completion_tokens, prompt_tokens + completion_tokens,
     )
+    _log_credits(model, prompt_tokens, completion_tokens)
 
     # --- Function-Calling Emulation: check response for tool calls ---
     if tools:
@@ -690,6 +815,8 @@ def stream_response(http_resp, model: str, prompt_tokens: int, tools: list | Non
                 except (json.JSONDecodeError, AttributeError):
                     chunk = data_str
 
+                chunk = strip_crawl_lines(chunk)
+
                 if chunk:
                     all_text += chunk
 
@@ -719,6 +846,7 @@ def stream_response(http_resp, model: str, prompt_tokens: int, tools: list | Non
         "Streaming complete — %dp + %dc = %d tokens",
         prompt_tokens, completion_tokens, prompt_tokens + completion_tokens,
     )
+    _log_credits(model, prompt_tokens, completion_tokens)
 
     # --- Function-Calling Emulation: parse buffered response ---
     if tools:
@@ -792,9 +920,10 @@ def index():
 @app.route("/v1/models")
 @limiter.limit("500 per minute")
 def list_models():
+    available = _model_registry.get_available_models()
     data = [
         {"id": m, "object": "model", "owned_by": "1minai", "created": 1727389042}
-        for m in AVAILABLE_MODELS
+        for m in available
     ]
     return jsonify({"data": data, "object": "list"})
 
@@ -816,18 +945,30 @@ def chat_completions():
         return openai_error("Missing API key.", "authentication_error", None, 401)
 
     body = request.json or {}
-    model       = body.get("model", DEFAULT_MODEL)
+    model       = body.get("model")
     messages    = body.get("messages", [])
     tools       = body.get("tools") or []          # OpenAI tools array (may be absent)
     tool_choice = body.get("tool_choice", "auto")  # "auto" | "none" | "required" | {..}
 
+    if not model:
+        return openai_error(
+            "No model specified.", "invalid_request_error", "invalid_request_error", 400
+        )
     if not messages:
         return openai_error(
             "No messages provided.", "invalid_request_error", "invalid_request_error", 400
         )
-    if RESTRICT_MODELS and model not in AVAILABLE_MODELS:
+    if RESTRICT_MODELS and model not in _model_registry.get_available_models():
         return openai_error(
             f"Model '{model}' not available.", "invalid_request_error", "model_not_found", 400
+        )
+
+    _meta      = _model_registry.get_model_meta(model)
+    max_tokens = body.get("max_tokens")
+    if _meta and max_tokens and max_tokens > _meta.get("MAX_OUTPUT_TOKEN", float("inf")):
+        return openai_error(
+            f"max_tokens {max_tokens} exceeds model limit of {_meta['MAX_OUTPUT_TOKEN']}.",
+            "invalid_request_error", "invalid_request_error", 400,
         )
 
     last_content = messages[-1].get("content")
@@ -852,7 +993,7 @@ def chat_completions():
     if isinstance(last_content, list):
         for item in last_content:
             if isinstance(item, dict) and "image_url" in item:
-                if model not in VISION_MODELS:
+                if not _model_registry.is_vision_model(model):
                     return openai_error(
                         f"Model '{model}' does not support image inputs.",
                         "invalid_request_error", "model_not_supported", 400,
@@ -863,6 +1004,11 @@ def chat_completions():
 
     prompt        = messages_to_prompt(messages)
     prompt_tokens = calculate_token(prompt, model)
+    if _meta and prompt_tokens > _meta.get("CONTEXT", float("inf")):
+        logger.warning(
+            "Prompt (%d tokens) überschreitet Kontextfenster von %s (%d tokens)",
+            prompt_tokens, model, _meta["CONTEXT"],
+        )
     payload       = build_payload(model, prompt, image_paths)
     logger.debug("PROMPT_TAIL: %s", prompt[-2000:])
     headers       = {"API-KEY": api_key, "Content-Type": "application/json; charset=utf-8"}
@@ -924,6 +1070,26 @@ if __name__ == "__main__":
     HOST    = os.getenv("PROXY_HOST", "0.0.0.0")
     PORT    = int(os.getenv("PROXY_PORT", "5001"))
     THREADS = int(os.getenv("PROXY_THREADS", "6"))
+
+    # Eager Fetch beim Start (Fehler nicht fatal)
+    try:
+        _model_registry.refresh()
+    except Exception:
+        pass
+
+    # Background-Refresh-Daemon
+    def _bg_refresh_loop():
+        interval = max(_MODEL_CACHE_TTL, 60)
+        while True:
+            time.sleep(interval)
+            try:
+                _model_registry.refresh()
+            except Exception:
+                pass
+
+    _bg = threading.Thread(target=_bg_refresh_loop, daemon=True, name="model-registry-refresh")
+    _bg.start()
+    logger.info("ModelRegistry: Background-Thread gestartet (Intervall=%ds)", _MODEL_CACHE_TTL)
 
     ip = socket.gethostbyname(socket.gethostname())
     logger.info(
