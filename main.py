@@ -270,15 +270,21 @@ class ModelRegistry:
     def _fetch_and_store(self):
         try:
             chat_models = self._fetch_feature("UNIFY_CHAT_WITH_AI")
-            self._all_models    = [m["modelId"] for m in chat_models]
-            self._vision_models = {m["modelId"] for m in chat_models
-                                   if "CHAT_WITH_IMAGE" in m.get("features", [])}
+            new_all     = [m["modelId"] for m in chat_models]
+            new_vision  = {m["modelId"] for m in chat_models
+                           if "CHAT_WITH_IMAGE" in m.get("features", [])}
+            changed = (new_all != self._all_models or new_vision != self._vision_models)
+            self._all_models    = new_all
+            self._vision_models = new_vision
             self._metadata      = {m["modelId"]: m["creditMetadata"]
                                    for m in chat_models if m.get("creditMetadata")}
             self._fetched_at  = time.monotonic()
             self._cache_valid = True
-            logger.info("ModelRegistry: %d Chat-Modelle, %d Vision-Modelle",
-                        len(self._all_models), len(self._vision_models))
+            if changed:
+                logger.info("ModelRegistry: %d Chat-Modelle, %d Vision-Modelle",
+                            len(self._all_models), len(self._vision_models))
+            else:
+                logger.debug("ModelRegistry: Refresh ohne Änderungen")
         except Exception as exc:
             logger.warning("ModelRegistry: Fetch fehlgeschlagen (%s) — %s", exc,
                            "nutze Stale-Cache" if self._cache_valid else "nutze Fallback-Liste")
