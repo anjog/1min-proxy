@@ -1,0 +1,18 @@
+[Unit]
+Description=1min.ai OpenAI-Compatible Proxy
+After=network.target
+
+[Service]
+# Adjust WorkingDirectory to your actual path (%h = $HOME)
+WorkingDirectory=%h/PATH/TO/1min-proxy
+Environment="PATH=%h/PATH/TO/1min-proxy/venv/bin:/usr/local/bin:/usr/bin:/bin"
+Environment=PYTHONUNBUFFERED=1
+EnvironmentFile=-%h/PATH/TO/1min-proxy/.env
+ExecStart=%h/PATH/TO/1min-proxy/venv/bin/python3 main.py
+Restart=always
+RestartSec=10
+StandardOutput=append:%h/PATH/TO/1min-proxy/proxy.log
+StandardError=append:%h/PATH/TO/1min-proxy/proxy.log
+
+[Install]
+WantedBy=default.target

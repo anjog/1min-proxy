@@ -45,11 +45,30 @@ cp .env.example .env
 ```bash
 # Directly
 venv/bin/python3 main.py
+```
 
-# With systemd
+### systemd system service (requires sudo)
+
+```bash
+# Edit 1min-proxy.service — replace User, Group, and /path/to/1min-proxy placeholders
 sudo cp 1min-proxy.service /etc/systemd/system/
 sudo systemctl daemon-reload
 sudo systemctl enable --now 1min-proxy
+```
+
+### systemd user service (no sudo required)
+
+Runs under your own user account. Starts on login; with linger enabled, also starts at boot.
+
+```bash
+# Edit 1min-proxy-user.service — replace PATH/TO/1min-proxy with your actual path
+mkdir -p ~/.config/systemd/user/
+cp 1min-proxy-user.service ~/.config/systemd/user/1min-proxy.service
+systemctl --user daemon-reload
+systemctl --user enable --now 1min-proxy
+
+# Optional: start automatically at boot without an active login session
+loginctl enable-linger $USER
 ```
 
 ## Configuration

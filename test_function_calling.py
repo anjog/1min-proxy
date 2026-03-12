@@ -1,5 +1,5 @@
 """
-Unit tests for the function-calling emulation in main.py.
+Unit tests for the function-calling emulation.
 
 Tests all 7 parse_tool_calls() patterns plus:
   - build_tool_system_prompt() with different tool_choice values
@@ -15,30 +15,28 @@ import os
 import json
 import unittest
 
-# ---------------------------------------------------------------------------
-# Import functions under test directly from main.py
-# We patch os.getenv to avoid needing .env / Memcached at import time.
-# ---------------------------------------------------------------------------
 os.environ.setdefault("MEMCACHED_HOST", "127.0.0.1")
 os.environ.setdefault("ONEMIN_API_KEY", "test-key")
 
-# Prevent waitress / limiter from doing anything real during import
+# FC functions live in function_calling.py — no Flask/waitress side effects
+from function_calling import (
+    parse_tool_calls,
+    build_tool_system_prompt,
+    inject_tools_into_messages,
+    _make_tool_call,
+    wrap_tool_calls_response,
+)
+
+# messages_to_prompt lives in main.py — patch side-effecting imports
 import unittest.mock as mock
 
 with mock.patch("waitress.serve"), \
      mock.patch("pymemcache.client.base.Client") as _mc:
     _mc.return_value.set.return_value = True
     _mc.return_value.get.return_value = None   # probe fails → in-memory limiter
-    import main  # noqa: E402  (must be after env setup)
+    import main  # noqa: E402
 
-from main import (
-    parse_tool_calls,
-    build_tool_system_prompt,
-    inject_tools_into_messages,
-    messages_to_prompt,
-    _make_tool_call,
-    wrap_tool_calls_response,
-)
+from main import messages_to_prompt
 
 # ---------------------------------------------------------------------------
 # Shared test fixtures
@@ -481,10 +479,10 @@ class TestWrapToolCallsResponse(unittest.TestCase):
     def test_structure(self):
         tc = _make_tool_call("get_weather", {"location": "Berlin"})
         resp = wrap_tool_calls_response(
-            text='<tool_call>{"name": "get_weather", "arguments": {"location": "Berlin"}}</tool_call>',
             tool_calls=[tc],
             model="deepseek-chat",
             prompt_tokens=42,
+            completion_tokens=10,
         )
         self.assertEqual(resp["object"], "chat.completion")
         choice = resp["choices"][0]
@@ -496,7 +494,7 @@ class TestWrapToolCallsResponse(unittest.TestCase):
 
     def test_model_preserved(self):
         tc = _make_tool_call("ping", {})
-        resp = wrap_tool_calls_response("", [tc], "gpt-4o", 10)
+        resp = wrap_tool_calls_response([tc], "gpt-4o", 10, 0)
         self.assertEqual(resp["model"], "gpt-4o")
 
 
