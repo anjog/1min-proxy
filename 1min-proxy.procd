@@ -1,0 +1,31 @@
+#!/bin/sh /etc/rc.common
+#
+# procd init script for 1min-proxy (OpenWRT)
+#
+# Installation:
+#   cp 1min-proxy.procd /etc/init.d/1min-proxy
+#   chmod +x /etc/init.d/1min-proxy
+#   /etc/init.d/1min-proxy enable
+#   /etc/init.d/1min-proxy start
+#
+# Logs: logread -f (system log) or: logread -e 1min-proxy
+#
+
+USE_PROCD=1
+START=95
+STOP=5
+
+# Adjust to your actual installation path
+PROXY_DIR=/opt/1min-proxy
+
+start_service() {
+    procd_open_instance
+    procd_set_param command "$PROXY_DIR/venv/bin/python3" main.py
+    procd_set_param dir "$PROXY_DIR"
+    procd_set_param env PYTHONUNBUFFERED=1
+    procd_set_param stdout 1
+    procd_set_param stderr 1
+    # respawn: <threshold_seconds> <timeout_seconds> <retry_count (0=infinite)>
+    procd_set_param respawn 300 5 0
+    procd_close_instance
+}

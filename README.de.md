@@ -71,6 +71,37 @@ systemctl --user enable --now 1min-proxy
 loginctl enable-linger $USER
 ```
 
+### OpenWRT (procd)
+
+OpenWRT nutzt procd statt systemd. Getestet auf arm64-Routern (z.B. BananaPi R4);
+für arm64 sind tiktoken-Wheels verfügbar, der Proxy läuft ohne Anpassungen.
+
+```bash
+# Python installieren
+opkg update
+opkg install python3 python3-pip
+
+# Proxy einrichten
+mkdir -p /opt/1min-proxy
+# Dateien per scp oder git clone kopieren
+cd /opt/1min-proxy
+python3 -m venv venv
+venv/bin/pip install -r requirements.txt
+cp .env.example .env
+# .env anpassen
+
+# procd-Init-Script installieren und aktivieren
+cp 1min-proxy.procd /etc/init.d/1min-proxy
+chmod +x /etc/init.d/1min-proxy
+/etc/init.d/1min-proxy enable
+/etc/init.d/1min-proxy start
+```
+
+Logs landen im System-Log und können so verfolgt werden:
+```bash
+logread -f -e 1min-proxy
+```
+
 ## Konfiguration
 
 | Variable | Standard | Beschreibung |
