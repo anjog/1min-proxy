@@ -84,21 +84,19 @@ class ModelRegistry:
     _FETCH_TIMEOUT = 8
 
     def __init__(self, base_url, ttl, permitted):
-        self._base_url  = base_url
-        self._ttl       = ttl
-        self._permitted = permitted   # leere Liste = alle
-        self._lock      = threading.Lock()
+        self._base_url      = base_url
+        self._ttl           = ttl
+        self._permitted_set = set(permitted)  # leere Menge = alle; pre-computed once
+        self._lock          = threading.Lock()
         self._all_models    = []
         self._vision_models = set()
         self._metadata      = {}   # modelId → creditMetadata dict
-        self._fetched_at    = 0.0
-        self._cache_valid   = False
+        self._fetched_at    = 0.0  # 0.0 means never fetched; positive means data available
 
     def get_available_models(self) -> list[str]:
         all_models = self._get_all_models()
-        if self._permitted:
-            permitted_set = set(self._permitted)
-            return [m for m in all_models if m in permitted_set]
+        if self._permitted_set:
+            return [m for m in all_models if m in self._permitted_set]
         return all_models
 
     def get_model_meta(self, model: str) -> dict | None:
@@ -107,7 +105,7 @@ class ModelRegistry:
 
     def is_vision_model(self, model: str) -> bool:
         self._ensure_fresh()
-        if self._cache_valid:
+        if self._fetched_at:
             return model in self._vision_models
         return model in FALLBACK_VISION_MODELS
 
@@ -117,13 +115,13 @@ class ModelRegistry:
 
     def _get_all_models(self):
         self._ensure_fresh()
-        return list(self._all_models) if self._cache_valid else list(FALLBACK_MODELS)
+        return list(self._all_models) if self._fetched_at else list(FALLBACK_MODELS)
 
     def _ensure_fresh(self):
-        if self._cache_valid and (time.monotonic() - self._fetched_at) < self._ttl:
+        if self._fetched_at and (time.monotonic() - self._fetched_at) < self._ttl:
             return  # Fast path ohne Lock
         with self._lock:
-            if self._cache_valid and (time.monotonic() - self._fetched_at) < self._ttl:
+            if self._fetched_at and (time.monotonic() - self._fetched_at) < self._ttl:
                 return
             self._fetch_and_store()
 
@@ -138,8 +136,7 @@ class ModelRegistry:
             self._vision_models = new_vision
             self._metadata      = {m["modelId"]: m["creditMetadata"]
                                    for m in chat_models if m.get("creditMetadata")}
-            self._fetched_at  = time.monotonic()
-            self._cache_valid = True
+            self._fetched_at = time.monotonic()
             if changed:
                 logger.info("ModelRegistry: %d Chat-Modelle, %d Vision-Modelle",
                             len(self._all_models), len(self._vision_models))

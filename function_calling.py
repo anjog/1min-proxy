@@ -25,6 +25,21 @@ import time
 
 logger = logging.getLogger("1min-proxy")
 
+# Pre-compiled tool-call detection patterns (in priority order)
+_RE_P1 = re.compile(r"<tool_call>\s*(\{.*?\})\s*</tool_call>", re.DOTALL)
+_RE_P2 = re.compile(
+    r'\{\s*"tool_call"\s*:\s*\{[^}]*"name"\s*:\s*"([^"]+)"[^}]*"arguments"\s*:\s*(\{.*?\})',
+    re.DOTALL,
+)
+_RE_P3_INVOKE = re.compile(r'<invoke\s+name="([^"]+)">(.*?)</invoke>', re.DOTALL)
+_RE_P3_PARAM  = re.compile(r'<parameter\s+name="([^"]+)">(.*?)</parameter>', re.DOTALL)
+_RE_P4 = re.compile(
+    r"<\|tool[▁\s]call[▁\s]begin\|>(.*?)<\|tool[▁\s]call[▁\s]end\|>", re.DOTALL
+)
+_RE_P5 = re.compile(r"\[TOOL_CALLS\]\s*(\[.*?\])", re.DOTALL)
+_RE_P6 = re.compile(r"<\|python_tag\|>(.*?)(?:<\|[a-z_]+\|>|$)", re.DOTALL)
+_RE_P7 = re.compile(r"✿FUNCTION✿:\s*(\S+)\s*✿ARGS✿:\s*(\{.*?\})", re.DOTALL)
+
 
 def build_tool_system_prompt(tools: list, tool_choice=None) -> str:
     """
@@ -129,11 +144,7 @@ def parse_tool_calls(text: str) -> list | None:
     tool_calls = []
 
     # --- Pattern 1: <tool_call>{...}</tool_call> (instructed format, all models) ---
-    for match in re.finditer(
-        r"<tool_call>\s*(\{.*?\})\s*</tool_call>",
-        text,
-        re.DOTALL,
-    ):
+    for match in _RE_P1.finditer(text):
         try:
             data = json.loads(match.group(1))
             name = data.get("name", "")
@@ -148,11 +159,7 @@ def parse_tool_calls(text: str) -> list | None:
         return tool_calls
 
     # --- Pattern 2: {"tool_call": {"name": ..., "arguments": ...}} ---
-    for match in re.finditer(
-        r'\{\s*"tool_call"\s*:\s*\{[^}]*"name"\s*:\s*"([^"]+)"[^}]*"arguments"\s*:\s*(\{.*?\})',
-        text,
-        re.DOTALL,
-    ):
+    for match in _RE_P2.finditer(text):
         try:
             name = match.group(1)
             arguments = json.loads(match.group(2))
@@ -165,21 +172,13 @@ def parse_tool_calls(text: str) -> list | None:
         return tool_calls
 
     # --- Pattern 3: <function_calls><invoke name="..."> (legacy Anthropic XML) ---
-    for match in re.finditer(
-        r'<invoke\s+name="([^"]+)">(.*?)</invoke>',
-        text,
-        re.DOTALL,
-    ):
+    for match in _RE_P3_INVOKE.finditer(text):
         try:
             name = match.group(1)
             # Parameters are encoded as <parameter name="key">value</parameter>
             params_raw = match.group(2)
             arguments = {}
-            for param in re.finditer(
-                r'<parameter\s+name="([^"]+)">(.*?)</parameter>',
-                params_raw,
-                re.DOTALL,
-            ):
+            for param in _RE_P3_PARAM.finditer(params_raw):
                 key = param.group(1)
                 value = param.group(2).strip()
                 # Try to parse as JSON, fall back to string
@@ -197,11 +196,7 @@ def parse_tool_calls(text: str) -> list | None:
 
     # --- Pattern 4: DeepSeek <|tool▁call▁begin|> format ---
     # DeepSeek R1/V3 uses Unicode "word joiner" chars in its tool tags
-    for match in re.finditer(
-        r"<\|tool[▁\s]call[▁\s]begin\|>(.*?)<\|tool[▁\s]call[▁\s]end\|>",
-        text,
-        re.DOTALL,
-    ):
+    for match in _RE_P4.finditer(text):
         try:
             data = json.loads(match.group(1).strip())
             name = data.get("name", "")
@@ -218,7 +213,7 @@ def parse_tool_calls(text: str) -> list | None:
     # --- Pattern 5: Mistral [TOOL_CALLS] [{...}] ---
     # Mistral models output a JSON array after the [TOOL_CALLS] sentinel.
     # Each element has "name" and "arguments".
-    for match in re.finditer(r"\[TOOL_CALLS\]\s*(\[.*?\])", text, re.DOTALL):
+    for match in _RE_P5.finditer(text):
         try:
             calls = json.loads(match.group(1))
             if not isinstance(calls, list):
@@ -239,11 +234,7 @@ def parse_tool_calls(text: str) -> list | None:
     # Llama 3.1 uses <|python_tag|> as a prefix for tool/code calls.
     # The JSON payload uses "parameters" instead of "arguments".
     # End is marked by <|eom_id|> or another special token, or end of string.
-    for match in re.finditer(
-        r"<\|python_tag\|>(.*?)(?:<\|[a-z_]+\|>|$)",
-        text,
-        re.DOTALL,
-    ):
+    for match in _RE_P6.finditer(text):
         try:
             data = json.loads(match.group(1).strip())
             name = data.get("name", "")
@@ -260,11 +251,7 @@ def parse_tool_calls(text: str) -> list | None:
     # --- Pattern 7: Qwen (older checkpoints) ✿FUNCTION✿ / ✿ARGS✿ ---
     # Older Qwen models (pre-2.5) use a proprietary marker format.
     # Qwen 2.5+ generally follows the instructed <tool_call> format instead.
-    for match in re.finditer(
-        r"✿FUNCTION✿:\s*(\S+)\s*✿ARGS✿:\s*(\{.*?\})",
-        text,
-        re.DOTALL,
-    ):
+    for match in _RE_P7.finditer(text):
         try:
             name = match.group(1).strip()
             arguments = json.loads(match.group(2))

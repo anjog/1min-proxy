@@ -163,6 +163,18 @@ def extract_api_key() -> str | None:
     return None
 
 
+def _mask_api_key(key: str) -> str:
+    return f"{key[:4]}...{key[-4:]}" if len(key) > 8 else "****"
+
+
+def _flatten_content(content: list) -> str:
+    return "\n".join(
+        item.get("text", "")
+        for item in content
+        if isinstance(item, dict) and "text" in item
+    )
+
+
 def openai_error(message: str, error_type: str, code: str | None, http_status: int):
     return jsonify({
         "error": {"message": message, "type": error_type, "param": None, "code": code}
@@ -199,11 +211,7 @@ def messages_to_prompt(messages: list) -> str:
             tc_id = msg.get("tool_call_id", "")
             tool_name = tool_call_map.get(tc_id, tc_id or "unknown")
             if isinstance(content, list):
-                content = "\n".join(
-                    item.get("text", "")
-                    for item in content
-                    if isinstance(item, dict) and "text" in item
-                )
+                content = _flatten_content(content)
             parts.append(f"Tool ({tool_name}): {content}")
             continue
 
@@ -224,11 +232,7 @@ def messages_to_prompt(messages: list) -> str:
                 continue
 
         if isinstance(content, list):
-            content = "\n".join(
-                item.get("text", "")
-                for item in content
-                if isinstance(item, dict) and "text" in item
-            )
+            content = _flatten_content(content)
         parts.append(f"{role.capitalize()}: {content}")
 
     if len(messages) > 1:
@@ -575,20 +579,20 @@ def chat_completions():
                 ONEMIN_CHAT_URL, json=payload, headers=headers, timeout=120
             )
             if resp.status_code == 401:
-                masked = f"{api_key[:4]}...{api_key[-4:]}" if len(api_key) > 8 else "****"
                 return openai_error(
-                    f"Invalid API key: {masked}.", "authentication_error", "invalid_api_key", 401
+                    f"Invalid API key: {_mask_api_key(api_key)}.", "authentication_error", "invalid_api_key", 401
                 )
             resp.raise_for_status()
         except requests.exceptions.HTTPError as exc:
             logger.error("1min.ai HTTP error: %s", exc)
             return jsonify({"error": {"message": str(exc)}}), 502
 
-        result     = transform_nonstream(resp.json(), model, prompt_tokens, tools or None)
+        result     = transform_nonstream(resp.json(), model, prompt_tokens, tools)
+        http_status = 502 if "error" in result else 200
         flask_resp = make_response(jsonify(result))
         flask_resp.headers["Content-Type"] = "application/json; charset=utf-8"
         flask_resp.headers["Access-Control-Allow-Origin"] = "*"
-        return flask_resp, 200
+        return flask_resp, http_status
 
     else:
         # Streaming
@@ -598,9 +602,8 @@ def chat_completions():
                 stream=True, timeout=120,
             )
             if stream_resp.status_code == 401:
-                masked = f"{api_key[:4]}...{api_key[-4:]}" if len(api_key) > 8 else "****"
                 return openai_error(
-                    f"Invalid API key: {masked}.", "authentication_error", "invalid_api_key", 401
+                    f"Invalid API key: {_mask_api_key(api_key)}.", "authentication_error", "invalid_api_key", 401
                 )
             stream_resp.raise_for_status()
         except requests.exceptions.RequestException as exc:
@@ -608,7 +611,7 @@ def chat_completions():
             return jsonify({"error": {"message": str(exc)}}), 502
 
         return Response(
-            stream_response(stream_resp, model, prompt_tokens, tools or None),
+            stream_response(stream_resp, model, prompt_tokens, tools),
             content_type="text/event-stream",
         )
 
